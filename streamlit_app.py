@@ -12,17 +12,20 @@ import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import re
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
-import networkx as nx
-from pyvis.network import Network
-import streamlit.components.v1 as components
+import gc
 import warnings
 
 warnings.filterwarnings('ignore')
+
+# pandas 2.3.2の新機能を活用
+pd.set_option('mode.copy_on_write', True)  # Copy-on-Write最適化
+pd.set_option('future.infer_string', True)  # 文字列型の推論を改善
+pd.set_option('display.max_colwidth', 50)  # 表示最適化
+
+# numpy 2.3.2の最適化設定
+np.set_printoptions(precision=3, suppress=True)
 
 # ページ設定
 st.set_page_config(
@@ -279,7 +282,7 @@ def load_data() -> pd.DataFrame:
             ).astype('float32')
         
         # Parquetファイルとして保存
-        df.to_parquet(PARQUET_FILE, engine='pyarrow', compression='snappy')
+        df.to_parquet(PARQUET_FILE, engine='pyarrow', compression='zstd')  # zstd圧縮で効率化（pyarrow 21.0.0）
         st.success("変換完了！次回からは高速に読み込めます。")
     
     # Parquetファイルから読み込み（超高速）
@@ -366,34 +369,23 @@ def filter_dataframe(df, ministries, statuses, types, recipients, actors=None, r
 
 
 
-# CSVエクスポート用キャッシュヘルパー
-@st.cache_data
+# CSVエクスポート用キャッシュヘルパー（メモリ最適化）
+@st.cache_data(ttl=300, max_entries=5)  # 5分キャッシュ、最大5エントリ
 def df_to_csv_bytes(df: pd.DataFrame, columns: List[str] | None = None) -> bytes:
     if columns:
         df = df[columns]
-    return df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+    # 小さいデータの場合は直接変換
+    if len(df) < 5000:
+        return df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+    # 大きいデータの場合はメモリ効率的に処理
+    from io import StringIO
+    output = StringIO()
+    df.to_csv(output, index=False)
+    result = output.getvalue().encode('utf-8-sig')
+    output.close()
+    return result
 
-# ---- Network utils ----
-def _has_cols(df: pd.DataFrame, cols: List[str]) -> bool:
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        st.warning("必要なカラムが見つかりません: " + ", ".join(missing))
-        return False
-    return True
-
-def _safe_notna(series: pd.Series) -> pd.Series:
-    # category/object列で 'nan' 文字列が混じるケースを吸収
-    s = series.astype(str)
-    return (s.str.lower() != 'nan') & (s.str.strip() != '')
-
-def _layout_for_graph(G: nx.Graph):
-    n = G.number_of_nodes()
-    if n == 0:
-        return {}
-    if n <= 30:
-        return nx.kamada_kawai_layout(G)
-    # spring_layout は重いので反復を抑える & 固定seed
-    return nx.spring_layout(G, k=1, iterations=30, seed=42)
+# Removed network utils as they are no longer needed
 
 # 手続詳細表示用のダイアログ
 @st.dialog("手続詳細情報", width="large")
@@ -409,157 +401,52 @@ def show_procedure_detail(procedure_id: str, df: pd.DataFrame):
     
     # ヘッダー情報
     st.markdown(f"### 📋 {r.get('手続名', '—')}")
-    st.markdown(f"**手続ID:** {r.get('手続ID', '—')}")
     
-    # タブで情報を整理
+    # 基本情報タブ
     tab1, tab2, tab3, tab4 = st.tabs(["基本情報", "オンライン化", "申請情報", "全データ"])
     
     with tab1:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("所管府省庁", r.get('所管府省庁', '—'))
-            st.metric("手続類型", r.get('手続類型', '—'))
-            st.metric("手続主体", r.get('手続主体', '—'))
-        with col2:
-            st.metric("手続の受け手", r.get('手続の受け手', '—'))
-            st.metric("事務区分", r.get('事務区分', '—'))
-            st.metric("府省共通手続", r.get('府省共通手続', '—'))
+        st.write("**手続ID:**", r.get('手続ID', '—'))
+        st.write("**法令名:**", r.get('法令名', '—'))
+        st.write("**所管府省庁:**", r.get('所管府省庁', '—'))
+        st.write("**手続類型:**", r.get('手続類型', '—'))
+        st.write("**手続の受手・申請先機関:**", r.get('手続の受手・申請先機関', '—'))
+        st.write("**法人番号:**", r.get('法人番号', '—'))
+        st.write("**手続の主体:**", r.get('手続の主体', '—'))
         
-        if pd.notna(r.get('法令名')):
-            st.info(f"**法令:** {r.get('法令名', '')} ({r.get('法令番号', '')})")
-    
     with tab2:
-        st.metric("オンライン化状況", r.get('オンライン化の実施状況', '—'))
+        st.write("**オンライン化の状況:**", r.get('オンライン化の状況', '—'))
+        st.write("**オンライン化実施時期:**", r.get('オンライン化実施時期', '—'))
+        st.write("**オンライン利用率:**", r.get('オンライン利用率', '—'))
+        st.write("**府省共通手続:**", r.get('府省共通手続', '—'))
         
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("総手続件数", f"{r.get('総手続件数', 0):,}")
-        with col2:
-            st.metric("オンライン件数", f"{r.get('オンライン手続件数', 0):,}")
-        with col3:
-            online_rate = 0
-            if r.get('総手続件数', 0) > 0:
-                online_rate = (r.get('オンライン手続件数', 0) / r.get('総手続件数', 1)) * 100
-            st.metric("オンライン化率", f"{online_rate:.1f}%")
-        
-        if pd.notna(r.get('情報システム(申請)')):
-            st.info(f"**申請システム:** {r.get('情報システム(申請)', '—')}")
-        if pd.notna(r.get('情報システム(事務処理)')):
-            st.info(f"**事務処理システム:** {r.get('情報システム(事務処理)', '—')}")
-    
     with tab3:
-        if pd.notna(r.get('申請書等に記載させる情報')):
-            st.markdown("**記載情報:**")
-            st.text_area("", r.get('申請書等に記載させる情報', '—'), height=100, disabled=True)
+        st.write("**申請システム名:**", r.get('申請システム名', '—'))
+        st.write("**添付書類の名称:**", r.get('添付書類の名称', '—'))
+        st.write("**総手続件数:**", r.get('総手続件数', '—'))
+        st.write("**オンライン手続件数:**", r.get('オンライン手続件数', '—'))
+        st.write("**非オンライン手続件数:**", r.get('非オンライン手続件数', '—'))
         
-        if pd.notna(r.get('申請時に添付させる書類')):
-            st.markdown("**添付書類:**")
-            st.text_area("", r.get('申請時に添付させる書類', '—'), height=100, disabled=True)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("手数料納付", r.get('手数料等の納付有無', '—'))
-        with col2:
-            st.metric("納付方法", r.get('手数料等の納付方法', '—'))
-    
     with tab4:
         # 全データを表形式で表示
-        data_dict = {col: str(r.get(col, '—')) for col in COLUMNS if col in r}
-        display_df = pd.DataFrame.from_dict(data_dict, orient='index', columns=['値'])
-        display_df.index.name = '項目名'
-        st.dataframe(display_df, use_container_width=True, height=400)
-
-
-# ---- PyVis renderer for interactive network visualization ----
-
-def _render_pyvis(G: nx.Graph, height: int = 700):
-    """Render a draggable/zoomable network with PyVis inside Streamlit."""
-    net = Network(height=f"{height}px", width="100%", bgcolor="#ffffff", font_color="#333", cdn_resources='in_line')
-    # Enable physics for interactive layout
-    net.barnes_hut(spring_length=120, damping=0.8)
-
-    for n, data in G.nodes(data=True):
-        label = str(n)
-        title = data.get('tooltip', label)
-        size = max(6, int(data.get('size', 10)))
-        color = data.get('color')
-        if color is None:
-            cat = data.get('category')
-            if cat == 'personal':
-                color = '#2ca02c'
-            elif cat == 'corporate':
-                color = '#d62728'
-            elif cat == 'procedure':
-                color = '#9467bd'
-        net.add_node(str(n), label=label, title=title, size=size, color=color)
-
-    for u, v, d in G.edges(data=True):
-        w = int(d.get('weight', 1))
-        net.add_edge(str(u), str(v), value=w, title=f"weight: {w}")
-
-    html = net.generate_html(notebook=False)
-    components.html(html, height=height, scrolling=True)
-
-# ---- Advanced network helpers (metrics, normalization, export) ----
-def _compute_centrality(G: nx.Graph, metric: str = 'degree') -> Dict[Any, float]:
-    if G.number_of_nodes() == 0:
-        return {}
-    metric = metric.lower()
-    if metric == 'degree':
-        return {n: float(d) for n, d in G.degree()}
-    if metric == 'betweenness':
-        return nx.betweenness_centrality(G, normalized=True)
-    if metric == 'eigenvector':
-        try:
-            return nx.eigenvector_centrality(G, max_iter=500)
-        except nx.PowerIterationFailedConvergence:
-            return nx.betweenness_centrality(G, normalized=True)
-    if metric == 'pagerank':
-        return nx.pagerank(G)
-    # default
-    return {n: float(d) for n, d in G.degree()}
-
-def _scale_sizes(values: Dict[Any, float], min_size: int = 8, max_size: int = 40) -> Dict[Any, int]:
-    if not values:
-        return {}
-    v = np.array(list(values.values()), dtype=float)
-    v = (v - v.min()) / (np.ptp(v) + 1e-9)  # 0-1
-    return {k: int(min_size + (max_size - min_size) * vv) for k, vv in zip(values.keys(), v)}
-
-def _export_nodes_edges(G: nx.Graph) -> tuple[pd.DataFrame, pd.DataFrame]:
-    nodes = []
-    for n, d in G.nodes(data=True):
-        nodes.append({'id': n, **{k: v for k, v in d.items() if k not in ['pos']}})
-    edges = []
-    for u, v, d in G.edges(data=True):
-        rec = {'source': u, 'target': v}
-        rec.update({k: v for k, v in d.items()})
-        edges.append(rec)
-    return pd.DataFrame(nodes), pd.DataFrame(edges)
-
-
-def _cosine_normalized_weight(n_xy: int, n_x: int, n_y: int) -> float:
-    # Safer than PMI for sparse small samples; 0..1 range roughly
-    if n_x == 0 or n_y == 0:
-        return 0.0
-    return n_xy / np.sqrt(n_x * n_y)
+        all_data = pd.DataFrame([r]).T
+        all_data.columns = ['値']
+        st.dataframe(all_data, use_container_width=True)
 
 # ---- Sankeyラベル改行ヘルパ ----
 def _wrap_label(text: Any, width: int = 10, max_lines: int = 3) -> str:
     """Wrap long (JP) labels with newlines so Sankey node text doesn't overlap.
-    width: number of characters per line (approx). max_lines: cap lines; add ellipsis when truncated.
-    """
-    if text is None:
-        return ""
-    s = str(text)
-    if width <= 0:
+    Very simple; just insert <br> every 'width' chars for Plotly."""
+    s = str(text).strip()
+    if len(s) <= width:
         return s
-    lines = [s[i:i+width] for i in range(0, len(s), width)]
-    if max_lines and len(lines) > max_lines:
-        lines = lines[:max_lines]
-        if not lines[-1].endswith('…'):
-            lines[-1] = lines[-1] + '…'
-    return "\n".join(lines)
+    lines = []
+    for i in range(0, len(s), width):
+        if len(lines) >= max_lines:
+            lines.append('...')
+            break
+        lines.append(s[i:i+width])
+    return '<br>'.join(lines)
 
 # ---- Multi-value splitter for JP list-like fields ----
 def _split_multi_values(val: Any) -> List[str]:
@@ -568,19 +455,19 @@ def _split_multi_values(val: Any) -> List[str]:
     s = str(val).strip()
     if s.lower() == 'nan' or s == '':
         return []
-    for sep in ['\n', '、', ',', '，', ';', '；', '・', '/', '／']:
+    for sep in ['、', ',', '，', ';', '；']:
         s = s.replace(sep, '、')
-    return [e.strip() for e in s.split('、') if e.strip()]
+    return [item.strip() for item in s.split('、') if item.strip()]
 
 # --- Top-N + その他 helper ---
 def _topn_with_other(series: pd.Series, top: int = 8, other_label: str = 'その他') -> pd.DataFrame:
-    """Return a DataFrame with columns [label, 件数] limited to top-
-    categories and aggregate the rest into 'その他'. The first column name will be inferred later."""
-    vc = series.value_counts()
-    dfv = vc.reset_index()
-    dfv.columns = ['label', '件数']
-    if len(dfv) > top:
-        keep = top - 1 if top >= 2 else 1
+    """Return a DataFrame with columns [label, 件数] limited to top-N + others."""
+    vcount = series.value_counts()
+    dfv = pd.DataFrame({'label': vcount.index, '件数': vcount.values})
+    if len(dfv) <= top:
+        return dfv
+    else:
+        keep = top
         top_df = dfv.iloc[:keep].copy()
         other_sum = dfv.iloc[keep:]['件数'].sum()
         other_row = pd.DataFrame({'label': [other_label], '件数': [other_sum]})
@@ -743,7 +630,7 @@ def _render_procedure_detail(proc_id: str, df: pd.DataFrame):
     
     # CSVエクスポート
     st.divider()
-    csv_data = pd.DataFrame([r]).to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+    csv_data = df_to_csv_bytes(pd.DataFrame([r]))
     st.download_button(
         label="📥 この手続の情報をCSVでダウンロード",
         data=csv_data,
@@ -932,11 +819,6 @@ def main():
             is_common=selected_common,
             count_ranges=selected_count_ranges,
         )
-
-        with st.expander("ℹ️ 項目定義（抜粋）"):
-            for k in ["手続類型", "手続主体", "手続の受け手", "事務区分", "府省共通手続", "オンライン化の実施状況"]:
-                if k in FIELD_DEFS:
-                    st.markdown(f"**{k}** — {FIELD_DEFS[k]}")
     
     # 詳細画面の表示（検索結果から遷移）
     if st.session_state.get('show_detail', False) and st.session_state.get('selected_procedure_id'):
@@ -952,12 +834,12 @@ def main():
     
     # メインコンテンツ（モバイルでは短いタブ名）
     if is_mobile:
-        tab_names = ["📊概要", "⚖️法令", "🏢省庁", "💻システム", "📎文書", "🔍検索", "🤖分析"]
+        tab_names = ["📊概要", "⚖️法令", "🏢省庁", "💻システム", "📎文書", "🔍検索"]
     else:
         tab_names = ["📊 概要統計", "⚖️ 法令別分析", "🏢 府省庁別分析",
-                    "💻 申請システム分析", "📎 申請文書分析", "🔍 法令・手続検索", "🤖 高度な分析(β)"]
+                    "💻 申請システム分析", "📎 申請文書分析", "🔍 法令・手続検索"]
     
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(tab_names)
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(tab_names)
     
     with tab1:
         st.header("📊 概要統計")
@@ -995,6 +877,7 @@ def main():
                     hole=0.4
                 )
                 st.plotly_chart(fig_pie, use_container_width=True)
+                del fig_pie
             else:
                 st.info("該当するデータがありません（円グラフ）")
 
@@ -1020,6 +903,7 @@ def main():
                     labels={'件数': '件数', '手続類型': '手続類型'}
                 )
                 st.plotly_chart(fig_bar, use_container_width=True)
+                del fig_bar
             else:
                 st.info("該当するデータがありません（棒グラフ）")
         
@@ -1037,20 +921,21 @@ def main():
         available_columns = [col for col in display_columns if col in filtered_df.columns]
         
         # 選択可能なデータフレームを表示
-        selection = st.dataframe(
+        event = st.dataframe(
             filtered_df[available_columns].reset_index(drop=True),
             use_container_width=True,
             height=400,
             selection_mode="single-row",
-            on_select="rerun"
+            on_select="rerun",
+            key="procedure_list_table"
         )
         
-        # 選択された行がある場合、詳細をダイアログで表示
-        if selection and selection.selection.rows:
-            selected_idx = selection.selection.rows[0]
+        # 選択された行がある場合、詳細をモーダルで表示
+        if event.selection and event.selection.rows:
+            selected_idx = event.selection.rows[0]
             selected_proc = filtered_df.iloc[selected_idx]
             
-            # 即座にダイアログを表示
+            # 詳細をモーダルで表示（自動的に開く）
             show_procedure_detail(selected_proc['手続ID'], df)
         
         # CSVダウンロードボタン
@@ -1080,6 +965,7 @@ def main():
             )
             fig_law.update_layout(height=600)
             st.plotly_chart(fig_law, use_container_width=True)
+            del fig_law
         
         # 法令別のオンライン化状況
         st.subheader("📊 主要法令のオンライン化状況")
@@ -1112,6 +998,7 @@ def main():
             labels={'オンライン化率': 'オンライン化率 (%)'}
         )
         st.plotly_chart(fig_law_online, use_container_width=True)
+        del fig_law_online
         
         # 法令別詳細テーブル
         st.subheader("📋 法令別詳細統計")
@@ -1138,8 +1025,10 @@ def main():
             else:
                 return 'その他'
         
-        filtered_df['法令種別'] = filtered_df['法令番号'].apply(classify_law_type)
-        law_type_counts = filtered_df['法令種別'].value_counts()
+        # in-place 追加は避け、一時DataFrameに列を付与
+        law_type_series = filtered_df['法令番号'].apply(classify_law_type) if '法令番号' in filtered_df.columns else pd.Series([], dtype='object')
+        tmp_df = filtered_df.assign(法令種別=law_type_series)
+        law_type_counts = tmp_df['法令種別'].value_counts()
         
         col1, col2 = st.columns(2)
         with col1:
@@ -1150,10 +1039,11 @@ def main():
                 hole=0.4
             )
             st.plotly_chart(fig_law_type, use_container_width=True)
+            del fig_law_type
         
         with col2:
             # 法令種別ごとのオンライン化率
-            law_type_online = filtered_df.groupby('法令種別').agg({
+            law_type_online = tmp_df.groupby('法令種別').agg({
                 '手続ID': 'count',
                 'オンライン化率': 'mean'
             }).reset_index()
@@ -1167,6 +1057,7 @@ def main():
                 labels={'平均オンライン化率': '平均オンライン化率 (%)'}
             )
             st.plotly_chart(fig_law_type_online, use_container_width=True)
+            del fig_law_type_online
     
     with tab3:
         st.header("🏢 府省庁別分析")
@@ -1181,6 +1072,7 @@ def main():
         )
         fig_ministry.update_layout(xaxis_tickangle=-45)
         st.plotly_chart(fig_ministry, use_container_width=True)
+        del fig_ministry
         
         # 府省庁別のオンライン化率
         ministry_stats = filtered_df.groupby('所管府省庁').agg({
@@ -1205,6 +1097,7 @@ def main():
             labels={'オンライン化率': 'オンライン化率 (%)'}
         )
         st.plotly_chart(fig_ministry_online, use_container_width=True)
+        del fig_ministry_online
         
         # 府省庁別詳細テーブル
         st.subheader("📋 府省庁別詳細統計")
@@ -1237,6 +1130,7 @@ def main():
                 labels={'x': '手続数', 'y': '申請システム'}
             )
             st.plotly_chart(fig_system, use_container_width=True)
+            del fig_system
             
             # システム別のオンライン化率
             system_stats = system_df.groupby('情報システム(申請)').agg({
@@ -1262,6 +1156,7 @@ def main():
                 labels={'オンライン化率': 'オンライン化率 (%)'}
             )
             st.plotly_chart(fig_system_scatter, use_container_width=True)
+            del fig_system_scatter
             
             # システム別詳細テーブル
             st.subheader("📋 申請システム別詳細統計")
@@ -1293,6 +1188,7 @@ def main():
                 labels={'x': '手続数', 'y': '事務処理システム'}
             )
             st.plotly_chart(fig_process_system, use_container_width=True)
+            del fig_process_system
             
             # 申請システムと事務処理システムの組み合わせ分析
             st.subheader("🔄 申請システムと事務処理システムの連携")
@@ -1349,6 +1245,7 @@ def main():
                     height=800
                 )
                 st.plotly_chart(fig_sankey, use_container_width=True)
+                del fig_sankey
 
                 st.caption("※ ノード名は10文字ごとに改行・最大3行で省略表示。ホバーで全名を確認できます。")
 
@@ -1399,6 +1296,7 @@ def main():
                             legend=dict(font=dict(size=11), tracegroupgap=4)
                         )
                         st.plotly_chart(fig, use_container_width=True)
+                        del fig
                     else:
                         st.info(f"'{cname}' のデータがありません")
 
@@ -1424,6 +1322,7 @@ def main():
                     )
                     fig_att.update_layout(margin=dict(l=0, r=0, t=40, b=0), height=520)
                     st.plotly_chart(fig_att, use_container_width=True)
+                    del fig_att
                     with st.expander("📥 集計CSVをダウンロード"):
                         st.download_button("添付書類TOPのCSV", df_to_csv_bytes(att_df), file_name="attachment_top.csv", mime="text/csv")
                 else:
@@ -1447,6 +1346,7 @@ def main():
                         ct = ct.loc[(ct.sum(axis=1)).sort_values(ascending=False).index]
                         fig_ct = px.imshow(ct, text_auto=True, aspect='auto', title='添付書類 × 手続類型（件数）')
                         st.plotly_chart(fig_ct, use_container_width=True)
+                        del fig_ct
                         with st.expander("📥 クロス集計CSV"):
                             st.download_button("クロス集計CSV", df_to_csv_bytes(ct.reset_index()), file_name="attachment_by_type.csv", mime="text/csv")
                 else:
@@ -1575,9 +1475,10 @@ def main():
                 display_df = search_df[display_columns].head(100).copy()
                 
                 # StreamlitのColumn Configurationを使用してクリック可能にする
+                # StreamlitのColumn Configurationを使用してクリック可能にする
                 if '手続ID' in display_columns:
                     # 手続IDがある場合は、選択機能を追加
-                    st.write("**📋 検索結果** ※行を選択して詳細ボタンをクリック")
+                    st.write("**📋 検索結果** ※行をクリックして詳細表示")
                     
                     # データエディタで選択可能にする
                     event = st.dataframe(
@@ -1594,7 +1495,7 @@ def main():
                         selected_row_idx = event.selection.rows[0]
                         selected_procedure = display_df.iloc[selected_row_idx]
                         
-                        # 即座にダイアログを表示（自動的にモーダルが開く）
+                        # 詳細をモーダルで表示
                         show_procedure_detail(selected_procedure['手続ID'], df)
                 else:
                     # 手続IDがない場合は通常のデータフレーム表示
@@ -1611,587 +1512,6 @@ def main():
                     file_name="search_results.csv",
                     mime="text/csv"
                 )
-    
-    
-    with tab7:
-        st.header("🤖 高度な分析(β)")
-        st.info("ベータ版：機械学習を用いた高度な分析機能を提供しています")
-        
-        # サブタブを作成
-        analysis_tab1, analysis_tab2, analysis_tab3 = st.tabs([
-            "🔬 クラスタリング・優先度分析",
-            "📊 相関分析",
-            "🕸️ ネットワーク分析"
-        ])
-        
-        with analysis_tab1:
-            # クラスタリング分析
-            st.subheader("🔬 府省庁のクラスタリング分析")
-            
-            # 府省庁ごとの特徴量を計算
-            ministry_features = filtered_df.groupby('所管府省庁').agg({
-                '手続ID': 'count',
-                '総手続件数': 'sum',
-                'オンライン手続件数': 'sum',
-                '非オンライン手続件数': 'sum'
-            }).reset_index()
-        
-            ministry_features.columns = ['府省庁', '手続数', '総手続件数', 'オンライン手続件数', '非オンライン手続件数']
-            ministry_features['オンライン化率'] = (
-                ministry_features['オンライン手続件数'] / ministry_features['総手続件数'] * 100
-            ).fillna(0)
-            ministry_features['平均手続件数'] = ministry_features['総手続件数'] / ministry_features['手続数']
-            
-            # 十分なデータがある府省庁のみ対象
-            ministry_features = ministry_features[ministry_features['総手続件数'] > 100]
-            
-            if len(ministry_features) > 3:
-                # 特徴量の標準化
-                features_for_clustering = ['手続数', 'オンライン化率', '平均手続件数']
-                X = ministry_features[features_for_clustering]
-                scaler = StandardScaler()
-                X_scaled = scaler.fit_transform(X)
-                
-                # K-meansクラスタリング
-                n_clusters = min(4, len(ministry_features) - 1)
-                kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-                ministry_features['クラスター'] = kmeans.fit_predict(X_scaled)
-                
-                # PCAで2次元に削減して可視化
-                pca = PCA(n_components=2)
-                X_pca = pca.fit_transform(X_scaled)
-                ministry_features['PC1'] = X_pca[:, 0]
-                ministry_features['PC2'] = X_pca[:, 1]
-                
-                # クラスタリング結果の可視化
-                fig_cluster = px.scatter(
-                    ministry_features,
-                    x='PC1',
-                    y='PC2',
-                    color='クラスター',
-                    hover_data=['府省庁', '手続数', 'オンライン化率', '平均手続件数'],
-                    title=f"府省庁のクラスタリング結果（{n_clusters}クラスター）",
-                    labels={'PC1': f'第1主成分 ({pca.explained_variance_ratio_[0]:.1%})',
-                            'PC2': f'第2主成分 ({pca.explained_variance_ratio_[1]:.1%})',
-                            'クラスター': 'クラスター'}
-                )
-                st.plotly_chart(fig_cluster, use_container_width=True)
-                
-                # クラスター別の特徴
-                st.subheader("📊 クラスター別特徴")
-                cluster_stats = ministry_features.groupby('クラスター')[features_for_clustering].mean().round(2)
-                st.dataframe(cluster_stats, use_container_width=True)
-                
-                # クラスター別府省庁リスト
-                st.subheader("📋 クラスター別府省庁")
-                for cluster_id in sorted(ministry_features['クラスター'].unique()):
-                    cluster_ministries = ministry_features[ministry_features['クラスター'] == cluster_id]['府省庁'].tolist()
-                    st.write(f"**クラスター {cluster_id}:** {', '.join(cluster_ministries[:10])}{'...' if len(cluster_ministries) > 10 else ''}")
-        
-        # 時系列分析（オンライン化実施時期）
-        st.subheader("📅 オンライン化実施時期の分析")
-        
-        # オンライン化実施時期の分布
-        time_data = filtered_df[filtered_df['オンライン化実施時期'].notna()]['オンライン化実施時期'].value_counts()
-        if len(time_data) > 0:
-            fig_timeline = px.bar(
-                x=time_data.index[:20],
-                y=time_data.values[:20],
-                title="オンライン化実施時期の分布（TOP20）",
-                labels={'x': '実施時期', 'y': '手続数'}
-            )
-            fig_timeline.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig_timeline, use_container_width=True)
-            
-            # 予測分析
-            st.subheader("🔮 オンライン化推進の優先度分析")
-            
-            # オンライン化されていない手続で、手続件数が多いものを抽出
-            not_online = filtered_df[
-                (filtered_df['オンライン化の実施状況'].str.contains('未実施|検討中|予定なし', na=False)) &
-                (filtered_df['総手続件数'] > 0)
-            ].copy()
-            
-            if len(not_online) > 0:
-                # 優先度スコアを計算（手続件数ベース）
-                not_online['優先度スコア'] = not_online['総手続件数']
-                
-                # 府省庁ごとに優先度スコアを集計
-                priority_by_ministry = not_online.groupby('所管府省庁')['優先度スコア'].sum().sort_values(ascending=False).head(15)
-                
-                fig_priority = px.bar(
-                    x=priority_by_ministry.values,
-                    y=priority_by_ministry.index,
-                    orientation='h',
-                    title="オンライン化優先度が高い府省庁（未実施手続の総件数ベース）",
-                    labels={'x': '優先度スコア（総手続件数）', 'y': '府省庁'}
-                )
-                st.plotly_chart(fig_priority, use_container_width=True)
-                
-                # 優先度の高い個別手続
-                st.subheader("🎯 オンライン化優先度TOP20手続")
-                top_priority = not_online.nlargest(20, '優先度スコア')[[
-                    '手続名', '所管府省庁', '総手続件数', 'オンライン化の実施状況'
-                ]]
-                st.dataframe(top_priority, use_container_width=True)
-        
-        with analysis_tab2:
-            # 数値データの相関分析
-            st.subheader("🔗 手続件数の相関関係")
-            
-            numeric_cols = ['総手続件数', 'オンライン手続件数', '非オンライン手続件数', 'オンライン化率']
-            correlation_data = filtered_df[numeric_cols].corr()
-        
-            # ヒートマップの作成
-            fig_heatmap = go.Figure(data=go.Heatmap(
-            z=correlation_data.values,
-            x=correlation_data.columns,
-            y=correlation_data.columns,
-            colorscale='RdBu',
-            zmid=0,
-            text=correlation_data.values.round(2),
-            texttemplate='%{text}',
-            textfont={"size": 10},
-            colorbar=dict(title="相関係数")
-            ))
-            fig_heatmap.update_layout(
-                title="手続件数関連指標の相関行列",
-                width=600,
-                height=500
-            )
-            st.plotly_chart(fig_heatmap, use_container_width=True)
-            
-            # カテゴリカルデータの関連性分析
-            st.subheader("📊 カテゴリ間の関連性")
-        
-            # オンライン化状況と手続類型のクロス集計
-            cross_tab = pd.crosstab(
-            filtered_df['手続類型'],
-            filtered_df['オンライン化の実施状況'],
-            normalize='index'
-            ) * 100
-            
-            # 上位10の手続類型のみ表示
-            top_types = filtered_df['手続類型'].value_counts().head(10).index
-            cross_tab_top = cross_tab.loc[cross_tab.index.isin(top_types)]
-            
-            # スタックドバーチャート
-            fig_stacked = go.Figure()
-            for col in cross_tab_top.columns:
-                fig_stacked.add_trace(go.Bar(
-                    name=col,
-                    y=cross_tab_top.index,
-                    x=cross_tab_top[col],
-                    orientation='h'
-                ))
-            
-            fig_stacked.update_layout(
-                title="手続類型別のオンライン化状況（％）",
-                barmode='stack',
-                xaxis_title="割合（％）",
-                yaxis_title="手続類型",
-                height=500
-            )
-            st.plotly_chart(fig_stacked, use_container_width=True)
-            
-            # 府省庁間の類似度分析
-            st.subheader("🏢 府省庁間の類似度分析")
-        
-            # 府省庁ごとの手続類型の分布を計算
-            ministry_procedure_matrix = pd.crosstab(
-            filtered_df['所管府省庁'],
-            filtered_df['手続類型']
-            )
-            
-            # 主要な府省庁のみ選択（手続数が多い上位20）
-            top_ministries = filtered_df['所管府省庁'].value_counts().head(20).index
-            ministry_procedure_matrix = ministry_procedure_matrix.loc[
-                ministry_procedure_matrix.index.isin(top_ministries)
-            ]
-            
-            if len(ministry_procedure_matrix) > 2:
-                # コサイン類似度を計算
-                from sklearn.metrics.pairwise import cosine_similarity
-                similarity_matrix = cosine_similarity(ministry_procedure_matrix)
-                similarity_df = pd.DataFrame(
-                    similarity_matrix,
-                    index=ministry_procedure_matrix.index,
-                    columns=ministry_procedure_matrix.index
-                )
-                
-                # 類似度ヒートマップ
-                fig_similarity = go.Figure(data=go.Heatmap(
-                z=similarity_df.values,
-                x=similarity_df.columns,
-                y=similarity_df.index,
-                colorscale='Viridis',
-                text=similarity_df.values.round(2),
-                texttemplate='%{text}',
-                textfont={"size": 8},
-                colorbar=dict(title="類似度")
-                ))
-                fig_similarity.update_layout(
-                    title="府省庁間の手続類型類似度",
-                    width=800,
-                    height=700
-                )
-                fig_similarity.update_layout(xaxis_tickangle=-45)
-                st.plotly_chart(fig_similarity, use_container_width=True)
-                
-                # 最も類似している府省庁ペア
-                st.subheader("🤝 最も類似している府省庁ペアTOP10")
-                similarity_pairs = []
-                for i in range(len(similarity_df)):
-                    for j in range(i+1, len(similarity_df)):
-                        similarity_pairs.append({
-                            '府省庁1': similarity_df.index[i],
-                            '府省庁2': similarity_df.index[j],
-                            '類似度': similarity_df.iloc[i, j]
-                        })
-                
-                similarity_pairs_df = pd.DataFrame(similarity_pairs)
-                top_similar = similarity_pairs_df.nlargest(10, '類似度')
-                st.dataframe(top_similar, use_container_width=True)
-        
-        with analysis_tab3:
-            st.subheader("🕸️ ネットワーク分析")
-
-        # 共通の描画オプション
-        col_opt1, col_opt2, col_opt3 = st.columns(3)
-        with col_opt1:
-            top_n = st.slider("対象ノードの上限 (TOP N)", 10, 100, 30, step=5, help="頻度の高いノードから上位N件に絞ります")
-        with col_opt2:
-            min_w = st.slider("エッジの最小重み (しきい値)", 1, 10, 2, step=1, help="共起回数や連携回数がこの値未満のエッジは非表示")
-        with col_opt3:
-            size_metric = st.selectbox("ノードサイズ指標", ["degree", "betweenness", "eigenvector", "pagerank"], index=0)
-
-        # ネットワーク図の種類を選択
-        network_type = st.radio(
-            "ネットワーク図の種類を選択",
-            ["府省庁間の連携ネットワーク", "手続類型の共起ネットワーク", "ライフイベントネットワーク"]
-        )
-
-        if network_type == "府省庁間の連携ネットワーク":
-            st.subheader("🏢 府省庁間の連携ネットワーク")
-
-            required_cols = ['所管府省庁', '府省共通手続']
-            if not _has_cols(filtered_df, required_cols):
-                st.stop()
-
-            with st.spinner("ネットワークを構築中..."):
-                common_procedures = filtered_df[_safe_notna(filtered_df['府省共通手続'])]
-                if len(common_procedures) == 0:
-                    st.warning("府省共通手続のデータがありません")
-                else:
-                    # 上位N府省庁に限定してノイズを抑制
-                    ministries = filtered_df['所管府省庁'].value_counts().head(top_n)
-
-                    # 府省庁ごとに「共通手続」の集合を作成
-                    group_sets = (
-                        common_procedures.groupby('所管府省庁')['府省共通手続']
-                        .apply(lambda s: set([x for x in s.dropna().astype(str).tolist()]))
-                        .to_dict()
-                    )
-
-                    G = nx.Graph()
-                    for ministry in ministries.index:
-                        G.add_node(ministry)
-
-                    # 各ペアの共通数と正規化重み（Jaccard風）を計算
-                    pairs = list(ministries.index)
-                    for i in range(len(pairs)):
-                        for j in range(i+1, len(pairs)):
-                            a, b = pairs[i], pairs[j]
-                            A, B = group_sets.get(a, set()), group_sets.get(b, set())
-                            inter = len(A & B)
-                            union = len(A | B)
-                            if inter == 0 or union == 0:
-                                continue
-                            # 重み: 共通件数と正規化（Jaccard）を併記
-                            w_raw = inter
-                            w_norm = inter / union
-                            if w_raw >= min_w:
-                                G.add_edge(a, b, weight=w_raw, norm_weight=round(w_norm, 3))
-
-                    # ノードサイズ = 選択した中心性
-                    cent = _compute_centrality(G, size_metric)
-                    sizes = _scale_sizes(cent, min_size=8, max_size=40)
-                    for n in G.nodes():
-                        G.nodes[n]['size'] = sizes.get(n, 12)
-                        G.nodes[n]['tooltip'] = f"{n}<br>{size_metric}: {cent.get(n, 0):.3f}"
-
-                    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
-                        st.warning("連携エッジを構成できませんでした（データ不足またはフィルタが厳しすぎます）")
-                    else:
-                        enable_interactive = st.toggle("ドラッグ可能なインタラクティブ表示（β）", value=True, key="net_ministry_interactive")
-                        if enable_interactive:
-                            _render_pyvis(G, height=700)
-                        else:
-                            pos = _layout_for_graph(G)
-
-                            edge_trace = []
-                            for (u, v, d) in G.edges(data=True):
-                                x0, y0 = pos[u]
-                                x1, y1 = pos[v]
-                                w = d.get('weight', 1)
-                                edge_trace.append(go.Scatter(
-                                    x=[x0, x1, None], y=[y0, y1, None], mode='lines',
-                                    line=dict(width=0.5 + w/5, color='#888'), hoverinfo='none'))
-
-                            node_x, node_y, node_text, node_size = [], [], [], []
-                            for node in G.nodes():
-                                x, y = pos[node]
-                                node_x.append(x); node_y.append(y)
-                                node_text.append(G.nodes[node].get('tooltip', node))
-                                node_size.append(G.nodes[node].get('size', 12))
-
-                            node_trace = go.Scatter(
-                                x=node_x, y=node_y, mode='markers+text', text=[str(n)[:10] for n in G.nodes()],
-                                textposition="top center", hovertext=node_text, hoverinfo='text',
-                                marker=dict(size=node_size, color='#1f77b4', line=dict(width=2, color='white'))
-                            )
-
-                            fig = go.Figure(data=edge_trace + [node_trace],
-                                layout=go.Layout(title='府省庁間の連携ネットワーク', showlegend=False, hovermode='closest',
-                                                 margin=dict(b=0,l=0,r=0,t=40),
-                                                 xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                                                 yaxis=dict(showgrid=False, zeroline=False, showticklabels=False), height=600))
-                            st.plotly_chart(fig, use_container_width=True)
-                        # CSVエクスポート
-                        nodes_df, edges_df = _export_nodes_edges(G)
-                        with st.expander("📥 ネットワークのCSVエクスポート"):
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                st.download_button("ノードCSVをダウンロード", df_to_csv_bytes(nodes_df), file_name="network_nodes.csv", mime="text/csv")
-                            with c2:
-                                st.download_button("エッジCSVをダウンロード", df_to_csv_bytes(edges_df), file_name="network_edges.csv", mime="text/csv")
-                        st.info(f"ノード数: {G.number_of_nodes()}, エッジ数: {G.number_of_edges()}")
-                        st.caption("※ エッジ重み=共通手続の件数（表示）、norm_weight=Jaccard風の正規化（内部属性）")
-
-        elif network_type == "手続類型の共起ネットワーク":
-            st.subheader("📝 手続類型の共起ネットワーク")
-            if not _has_cols(filtered_df, ['所管府省庁', '手続類型']):
-                st.stop()
-            with st.spinner("共起ネットワークを構築中..."):
-                # 出現頻度の高い手続類型に限定
-                procedure_types = filtered_df['手続類型'].value_counts().head(top_n)
-                target_types = set(procedure_types.index)
-
-                # 府省庁ごとの手続類型集合
-                ministry_groups = filtered_df.groupby('所管府省庁')['手続類型'].apply(lambda s: set([x for x in s.dropna().tolist()]))
-
-                # 各タイプの出現数
-                type_freq = {t: 0 for t in target_types}
-                for types in ministry_groups:
-                    for t in types:
-                        if t in type_freq:
-                            type_freq[t] += 1
-
-                # 共起回数と正規化重み（cosine）
-                from collections import defaultdict
-                co_counts = defaultdict(int)
-                for types in ministry_groups:
-                    ts = [t for t in types if t in target_types]
-                    for i in range(len(ts)):
-                        for j in range(i+1, len(ts)):
-                            a, b = sorted((ts[i], ts[j]))
-                            co_counts[(a, b)] += 1
-
-                G = nx.Graph()
-                for t in target_types:
-                    G.add_node(t)
-
-                for (a, b), c in co_counts.items():
-                    w = _cosine_normalized_weight(c, type_freq.get(a, 1), type_freq.get(b, 1))
-                    if c >= min_w and w > 0:
-                        G.add_edge(a, b, weight=c, norm_weight=round(w, 3))
-
-                # ノードサイズ = 選択した中心性
-                cent = _compute_centrality(G, size_metric)
-                sizes = _scale_sizes(cent, min_size=8, max_size=40)
-                for n in G.nodes():
-                    G.nodes[n]['size'] = sizes.get(n, 12)
-                    G.nodes[n]['tooltip'] = f"{n}<br>{size_metric}: {cent.get(n, 0):.3f}"
-
-                if G.number_of_nodes() > 0:
-                    enable_interactive = st.toggle("ドラッグ可能なインタラクティブ表示（β）", value=True, key="net_cooccurrence_interactive")
-                    if enable_interactive:
-                        _render_pyvis(G, height=700)
-                    else:
-                        pos = _layout_for_graph(G)
-
-                        # エッジの描画
-                        edge_trace = []
-                        for edge in G.edges(data=True):
-                            x0, y0 = pos[edge[0]]
-                            x1, y1 = pos[edge[1]]
-                            weight = edge[2].get('weight', 1)
-                            edge_trace.append(go.Scatter(
-                                x=[x0, x1, None],
-                                y=[y0, y1, None],
-                                mode='lines',
-                                line=dict(width=0.5 + weight/5, color='#888'),
-                                hoverinfo='none'
-                            ))
-
-                        # ノードの描画
-                        node_x, node_y, node_text, node_size = [], [], [], []
-                        for node in G.nodes():
-                            x, y = pos[node]
-                            node_x.append(x)
-                            node_y.append(y)
-                            node_text.append(G.nodes[node].get('tooltip', node))
-                            node_size.append(G.nodes[node].get('size', 12))
-
-                        node_trace = go.Scatter(
-                            x=node_x,
-                            y=node_y,
-                            mode='markers',
-                            hovertext=node_text,
-                            hoverinfo='text',
-                            marker=dict(
-                                size=node_size,
-                                color='#ff7f0e',
-                                line=dict(width=2, color='white')
-                            )
-                        )
-
-                        fig = go.Figure(data=edge_trace + [node_trace],
-                                       layout=go.Layout(
-                                           title='手続類型の共起ネットワーク',
-                                           showlegend=False,
-                                           hovermode='closest',
-                                           margin=dict(b=0,l=0,r=0,t=40),
-                                           xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                                           yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                                           height=600
-                                       ))
-
-                        st.plotly_chart(fig, use_container_width=True)
-                    # CSVエクスポート
-                    nodes_df, edges_df = _export_nodes_edges(G)
-                    with st.expander("📥 ネットワークのCSVエクスポート"):
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            st.download_button("ノードCSVをダウンロード", df_to_csv_bytes(nodes_df), file_name="network_nodes.csv", mime="text/csv")
-                        with c2:
-                            st.download_button("エッジCSVをダウンロード", df_to_csv_bytes(edges_df), file_name="network_edges.csv", mime="text/csv")
-                    st.info(f"ノード数: {G.number_of_nodes()}, エッジ数: {G.number_of_edges()}")
-                    st.caption("※ エッジ重み=共起回数、norm_weight=cosine正規化（内部属性）")
-
-        else:  # ライフイベントネットワーク
-            st.subheader("🌟 ライフイベントネットワーク")
-            if not _has_cols(filtered_df, ['手続類型', '手続が行われるイベント(個人)', '手続が行われるイベント(法人)']):
-                st.stop()
-            with st.spinner("ライフイベントネットワークを構築中..."):
-                G = nx.Graph()
-
-                def _split_events(val: Any) -> List[str]:
-                    if val is None or (isinstance(val, float) and np.isnan(val)):
-                        return []
-                    s = str(val).strip()
-                    if s.lower() == 'nan' or s == '':
-                        return []
-                    for sep in ['、', ',', '，', ';', '；']:
-                        s = s.replace(sep, '、')
-                    return [e.strip() for e in s.split('、') if e.strip()]
-
-                from collections import Counter
-                life_events_personal = []
-                for events in filtered_df['手続が行われるイベント(個人)']:
-                    life_events_personal.extend(_split_events(events))
-                life_events_corporate = []
-                for events in filtered_df['手続が行われるイベント(法人)']:
-                    life_events_corporate.extend(_split_events(events))
-
-                personal_counter = Counter(life_events_personal)
-                corporate_counter = Counter(life_events_corporate)
-
-                top_personal = dict(personal_counter.most_common(top_n//2))
-                top_corporate = dict(corporate_counter.most_common(top_n//2))
-
-                for event, count in top_personal.items():
-                    G.add_node(f"個人: {event}", size=int(np.log(count + 1) * 10), category="personal")
-                for event, count in top_corporate.items():
-                    G.add_node(f"法人: {event}", size=int(np.log(count + 1) * 10), category="corporate")
-
-                top_proc_types = set(filtered_df['手続類型'].value_counts().head(15).index)
-                sub = filtered_df[filtered_df['手続類型'].isin(top_proc_types)]
-                for _, row in sub.iterrows():
-                    proc_type = row['手続類型']
-                    for event in _split_events(row['手続が行われるイベント(個人)']):
-                        node_name = f"個人: {event}"
-                        if event in top_personal and node_name in G.nodes:
-                            if proc_type not in G.nodes:
-                                G.add_node(proc_type, size=5, category="procedure")
-                            G.add_edge(node_name, proc_type)
-                    for event in _split_events(row['手続が行われるイベント(法人)']):
-                        node_name = f"法人: {event}"
-                        if event in top_corporate and node_name in G.nodes:
-                            if proc_type not in G.nodes:
-                                G.add_node(proc_type, size=5, category="procedure")
-                            G.add_edge(node_name, proc_type)
-
-                # ノードサイズ = 選択した中心性（種類に関係なく）
-                cent = _compute_centrality(G, size_metric)
-                sizes = _scale_sizes(cent, min_size=8, max_size=40)
-                for n in G.nodes():
-                    G.nodes[n]['size'] = sizes.get(n, 12)
-                    tt = f"{n}<br>{size_metric}: {cent.get(n, 0):.3f}"
-                    G.nodes[n]['tooltip'] = tt
-
-                if G.number_of_nodes() == 0:
-                    st.warning("ネットワークを構成できませんでした（データ不足またはフィルタが厳しすぎます）")
-                else:
-                    enable_interactive = st.toggle("ドラッグ可能なインタラクティブ表示（β）", value=True, key="net_lifeevent_interactive")
-                    if enable_interactive:
-                        _render_pyvis(G, height=700)
-                    else:
-                        pos = _layout_for_graph(G)
-
-                        edge_trace = []
-                        for (u, v) in G.edges():
-                            x0, y0 = pos[u]
-                            x1, y1 = pos[v]
-                            edge_trace.append(go.Scatter(
-                                x=[x0, x1, None], y=[y0, y1, None], mode='lines',
-                                line=dict(width=0.5, color='#888'), hoverinfo='none'))
-
-                        node_traces = []
-                        categories = {'personal': '#2ca02c', 'corporate': '#d62728', 'procedure': '#9467bd'}
-                        symbols = {'personal': 'circle', 'corporate': 'square', 'procedure': 'diamond'}
-
-                        for cat, color in categories.items():
-                            node_x, node_y, node_text, node_size = [], [], [], []
-                            for node in G.nodes():
-                                if G.nodes[node].get('category', 'procedure') == cat:
-                                    x, y = pos[node]
-                                    node_x.append(x); node_y.append(y)
-                                    node_text.append(G.nodes[node].get('tooltip', node))
-                                    node_size.append(G.nodes[node].get('size', 10))
-                            if node_x:
-                                node_traces.append(go.Scatter(
-                                    x=node_x, y=node_y, mode='markers', name={'personal': '個人イベント', 'corporate': '法人イベント', 'procedure': '手続類型'}[cat],
-                                    hovertext=node_text, hoverinfo='text',
-                                    marker=dict(size=node_size, color=color, symbol=symbols[cat], line=dict(width=2, color='white'))
-                                ))
-
-                        fig = go.Figure(data=edge_trace + node_traces,
-                            layout=go.Layout(title='ライフイベントネットワーク', showlegend=True, hovermode='closest',
-                                             margin=dict(b=0,l=0,r=0,t=40),
-                                             xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                                             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False), height=600))
-                        st.plotly_chart(fig, use_container_width=True)
-                    # CSVエクスポート
-                    nodes_df, edges_df = _export_nodes_edges(G)
-                    with st.expander("📥 ネットワークのCSVエクスポート"):
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            st.download_button("ノードCSVをダウンロード", df_to_csv_bytes(nodes_df), file_name="network_nodes.csv", mime="text/csv")
-                        with c2:
-                            st.download_button("エッジCSVをダウンロード", df_to_csv_bytes(edges_df), file_name="network_edges.csv", mime="text/csv")
-                    st.info(f"ノード数: {G.number_of_nodes()}, エッジ数: {G.number_of_edges()}")
-                    st.caption("※ ノードサイズは中心性に基づきます（選択可能）")
 
 if __name__ == "__main__":
     main()
