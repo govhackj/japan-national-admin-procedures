@@ -9,7 +9,11 @@
 このプロジェクトは、日本政府の法令に基づく行政手続等のオンライン化状況を可視化・分析するためのStreamlitベースのダッシュボードです。デジタル庁が公開している「行政手続等の悉皆調査結果等」(令和7年7月29日)のデータをもとに作成しています。
 https://www.digital.go.jp/resources/procedures-survey-results
 
+Streamlitサイトでpublic deployしていますので試すことも可能です。
+https://japan-national-adm-procedures.streamlit.app/
+
 各府省庁の手続きのオンライン化率、申請システムの利用状況、法令別の分析など、多角的な視点から行政手続のデジタル化の現状を把握できます。
+
 
 ## ✨ 主な機能
 
