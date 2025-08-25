@@ -29,8 +29,77 @@ st.set_page_config(
     page_title="行政手続等オンライン化状況ダッシュボード",
     page_icon="⚖️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"  # モバイルではデフォルトで折りたたみ
 )
+
+# モバイル対応のCSSを追加
+st.markdown("""
+<style>
+/* モバイル対応のスタイル */
+@media (max-width: 768px) {
+    /* タブのスクロール対応 */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0.5rem;
+        overflow-x: auto;
+        overflow-y: hidden;
+        -webkit-overflow-scrolling: touch;
+    }
+    
+    /* カラムの縦積み */
+    [data-testid="column"]:not(:only-child) {
+        width: 100% !important;
+        flex: 1 1 100% !important;
+    }
+    
+    /* データフレームの横スクロール対応 */
+    .stDataFrame {
+        overflow-x: auto;
+    }
+    
+    /* メトリクスカードの調整 */
+    [data-testid="metric-container"] {
+        padding: 0.5rem;
+    }
+    
+    /* ボタンのタッチ領域を拡大 */
+    .stButton button {
+        min-height: 2.5rem;
+        touch-action: manipulation;
+    }
+    
+    /* グラフの高さ調整 */
+    .js-plotly-plot {
+        height: auto !important;
+        max-height: 350px !important;
+    }
+    
+    /* タイトルの文字サイズ調整 */
+    h1 {
+        font-size: 1.5rem !important;
+    }
+    
+    /* サイドバーの幅調整 */
+    section[data-testid="stSidebar"] > div {
+        width: 270px !important;
+    }
+}
+
+/* タブレット対応 */
+@media (min-width: 769px) and (max-width: 1024px) {
+    [data-testid="column"] {
+        flex: 1 1 50% !important;
+    }
+}
+
+/* ダイアログのモバイル対応 */
+@media (max-width: 768px) {
+    [data-testid="stModal"] > div:first-child {
+        max-width: 95% !important;
+        margin: 1rem !important;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
 
 # データファイルのパス
 DATA_DIR = Path(__file__).parent / "docs"
@@ -326,6 +395,80 @@ def _layout_for_graph(G: nx.Graph):
     # spring_layout は重いので反復を抑える & 固定seed
     return nx.spring_layout(G, k=1, iterations=30, seed=42)
 
+# 手続詳細表示用のダイアログ
+@st.dialog("手続詳細情報", width="large")
+def show_procedure_detail(procedure_id: str, df: pd.DataFrame):
+    """手続の詳細情報をダイアログで表示"""
+    # 該当する手続を検索
+    procedure = df[df['手続ID'] == procedure_id]
+    if procedure.empty:
+        st.error(f"手続ID: {procedure_id} が見つかりません")
+        return
+    
+    r = procedure.iloc[0].to_dict()
+    
+    # ヘッダー情報
+    st.markdown(f"### 📋 {r.get('手続名', '—')}")
+    st.markdown(f"**手続ID:** {r.get('手続ID', '—')}")
+    
+    # タブで情報を整理
+    tab1, tab2, tab3, tab4 = st.tabs(["基本情報", "オンライン化", "申請情報", "全データ"])
+    
+    with tab1:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("所管府省庁", r.get('所管府省庁', '—'))
+            st.metric("手続類型", r.get('手続類型', '—'))
+            st.metric("手続主体", r.get('手続主体', '—'))
+        with col2:
+            st.metric("手続の受け手", r.get('手続の受け手', '—'))
+            st.metric("事務区分", r.get('事務区分', '—'))
+            st.metric("府省共通手続", r.get('府省共通手続', '—'))
+        
+        if pd.notna(r.get('法令名')):
+            st.info(f"**法令:** {r.get('法令名', '')} ({r.get('法令番号', '')})")
+    
+    with tab2:
+        st.metric("オンライン化状況", r.get('オンライン化の実施状況', '—'))
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("総手続件数", f"{r.get('総手続件数', 0):,}")
+        with col2:
+            st.metric("オンライン件数", f"{r.get('オンライン手続件数', 0):,}")
+        with col3:
+            online_rate = 0
+            if r.get('総手続件数', 0) > 0:
+                online_rate = (r.get('オンライン手続件数', 0) / r.get('総手続件数', 1)) * 100
+            st.metric("オンライン化率", f"{online_rate:.1f}%")
+        
+        if pd.notna(r.get('情報システム(申請)')):
+            st.info(f"**申請システム:** {r.get('情報システム(申請)', '—')}")
+        if pd.notna(r.get('情報システム(事務処理)')):
+            st.info(f"**事務処理システム:** {r.get('情報システム(事務処理)', '—')}")
+    
+    with tab3:
+        if pd.notna(r.get('申請書等に記載させる情報')):
+            st.markdown("**記載情報:**")
+            st.text_area("", r.get('申請書等に記載させる情報', '—'), height=100, disabled=True)
+        
+        if pd.notna(r.get('申請時に添付させる書類')):
+            st.markdown("**添付書類:**")
+            st.text_area("", r.get('申請時に添付させる書類', '—'), height=100, disabled=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("手数料納付", r.get('手数料等の納付有無', '—'))
+        with col2:
+            st.metric("納付方法", r.get('手数料等の納付方法', '—'))
+    
+    with tab4:
+        # 全データを表形式で表示
+        data_dict = {col: str(r.get(col, '—')) for col in COLUMNS if col in r}
+        display_df = pd.DataFrame.from_dict(data_dict, orient='index', columns=['値'])
+        display_df.index.name = '項目名'
+        st.dataframe(display_df, use_container_width=True, height=400)
+
 
 # ---- PyVis renderer for interactive network visualization ----
 
@@ -611,9 +754,35 @@ def _render_procedure_detail(proc_id: str, df: pd.DataFrame):
 def main():
     """メインアプリケーション"""
     
-    # タイトル
-    st.title("⚖️ 日本の法令に基づく行政手続等オンライン化状況ダッシュボード")
-    st.markdown("約75,000件の法令・行政手続データを可視化・分析")
+    # モバイル判定用のセッション状態初期化
+    if 'screen_width' not in st.session_state:
+        st.session_state.screen_width = None
+    
+    # JavaScriptで画面幅を取得
+    st.components.v1.html(
+        """
+        <script>
+        const streamlitDoc = window.parent.document;
+        const width = window.innerWidth;
+        streamlitDoc.dispatchEvent(new CustomEvent('streamlit:setComponentValue', {
+            detail: {value: width, dataType: 'json'},
+        }));
+        </script>
+        """,
+        height=0
+    )
+    
+    # モバイル判定（768px以下）
+    screen_width = st.session_state.get('screen_width', 1200)
+    is_mobile = screen_width <= 768 if screen_width is not None else False
+    
+    # タイトル（モバイルでは省略）
+    if is_mobile:
+        st.title("⚖️ 行政手続DB")
+        st.caption("約75,000件の法令・手続データ")
+    else:
+        st.title("⚖️ 日本の法令に基づく行政手続等オンライン化状況ダッシュボード")
+        st.markdown("約75,000件の法令・行政手続データを可視化・分析")
     
     # データ読み込み（初回のみ）
     if not st.session_state.data_loaded:
@@ -781,16 +950,14 @@ def main():
         _render_procedure_detail(st.session_state['selected_procedure_id'], df)
         return
     
-    # メインコンテンツ
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "📊 概要統計", 
-        "⚖️ 法令別分析", 
-        "🏢 府省庁別分析",
-        "💻 申請システム分析",
-        "📎 申請文書分析",
-        "🔍 法令・手続検索",
-        "🤖 高度な分析(β)"
-    ])
+    # メインコンテンツ（モバイルでは短いタブ名）
+    if is_mobile:
+        tab_names = ["📊概要", "⚖️法令", "🏢省庁", "💻システム", "📎文書", "🔍検索", "🤖分析"]
+    else:
+        tab_names = ["📊 概要統計", "⚖️ 法令別分析", "🏢 府省庁別分析",
+                    "💻 申請システム分析", "📎 申請文書分析", "🔍 法令・手続検索", "🤖 高度な分析(β)"]
+    
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(tab_names)
     
     with tab1:
         st.header("📊 概要統計")
@@ -883,16 +1050,8 @@ def main():
             selected_idx = selection.selection.rows[0]
             selected_proc = filtered_df.iloc[selected_idx]
             
-            @st.dialog(f"📄 手続詳細: {selected_proc['手続名'][:30]}...", width="large")
-            def show_procedure_modal():
-                _render_procedure_detail(selected_proc['手続ID'], df)
-            
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                st.info(f"選択された手続: {selected_proc['手続名']}")
-            with col2:
-                if st.button("📄 詳細を表示", key="overview_detail_btn"):
-                    show_procedure_modal()
+            # 即座にダイアログを表示
+            show_procedure_detail(selected_proc['手続ID'], df)
         
         # CSVダウンロードボタン
         csv_data = df_to_csv_bytes(filtered_df[available_columns])
@@ -1435,19 +1594,8 @@ def main():
                         selected_row_idx = event.selection.rows[0]
                         selected_procedure = display_df.iloc[selected_row_idx]
                         
-                        @st.dialog(f"📄 手続詳細: {selected_procedure.get('手続名', '')[:30]}...", width="large")
-                        def show_search_modal():
-                            _render_procedure_detail(selected_procedure['手続ID'], df)
-                        
-                        col1, col2, col3 = st.columns([2, 1, 4])
-                        with col1:
-                            st.info(f"選択: {selected_procedure['手続ID']}")
-                        with col2:
-                            if st.button("詳細を表示", type="primary"):
-                                show_search_modal()
-                        with col3:
-                            # 手続名を表示
-                            st.text(f"{selected_procedure.get('手続名', '')[:40]}...")
+                        # 即座にダイアログを表示（自動的にモーダルが開く）
+                        show_procedure_detail(selected_procedure['手続ID'], df)
                 else:
                     # 手続IDがない場合は通常のデータフレーム表示
                     st.dataframe(
